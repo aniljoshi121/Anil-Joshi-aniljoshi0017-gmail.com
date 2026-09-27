@@ -71,14 +71,57 @@ export function issueAccessToken({ userId, orgId, role, permVersion }, secret) {
 // `node scripts/check-jwt.js` is the public test suite for this function.
 // ---------------------------------------------------------------------------
 export function verifyAccessToken(token, secret) {
-  // YOURS TO WRITE. Every failure mode listed above must be a 401 UNAUTHENTICATED.
-  // `node scripts/check-jwt.js` is the public suite for this function.
-  throw Object.assign(
-    new Error('TODO: server/auth.js — verifyAccessToken() is yours to write (AUTH-DATA-MODEL.md §10).'),
-    { code: 'NOT_IMPLEMENTED' }
-  );
+  if (typeof token !== 'string') throw unauthenticated('missing access token');
+
+  const parts = token.split('.');
+  if (parts.length !== 3) throw unauthenticated('malformed access token');
+  const [headerPart, payloadPart, signaturePart] = parts;
+
+  // Pin the algorithm: we only ever issue HS256, so we only ever accept HS256.
+  // The header is attacker-controlled, so it is checked, never obeyed.
+  const header = decodeJsonSegment(headerPart);
+  if (header.alg !== ALG || header.typ !== 'JWT') {
+    throw unauthenticated('unsupported token algorithm');
+  }
+
+  // Check the signature before trusting anything in the payload.
+  const expected = createHmac('sha256', secret).update(`${headerPart}.${payloadPart}`).digest();
+  const actual = unb64(signaturePart);
+  // timingSafeEqual throws on unequal lengths, so compare lengths first.
+  if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) {
+    throw unauthenticated('invalid token signature');
+  }
+
+  const claims = decodeJsonSegment(payloadPart);
+  const now = Math.floor(Date.now() / 1000);
+
+  // exp is an exclusive bound: a token whose exp equals now is already expired.
+  if (typeof claims.exp !== 'number' || claims.exp <= now) {
+    throw unauthenticated('access token expired');
+  }
+  if (claims.iss !== ISS || claims.aud !== AUD) {
+    throw unauthenticated('token was not issued for this API');
+  }
+  if (typeof claims.jti !== 'string' || claims.jti === '') {
+    throw unauthenticated('token has no id');
+  }
+
+  return claims;
 }
 
+// Decode one base64url JWT segment into a plain object, or fail as a 401.
+function decodeJsonSegment(segment) {
+  let value;
+  try {
+    value = JSON.parse(unb64(segment).toString('utf8'));
+  } catch {
+    throw unauthenticated('malformed access token');
+  }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw unauthenticated('malformed access token');
+  }
+  return value;
+}
 
 // The freshness check (AUTH-DATA-MODEL.md §3). Compares the token's pv against the
 // membership's current perm_version. Note `!==`, not `<`: a token from the future is
